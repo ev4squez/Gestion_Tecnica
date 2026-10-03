@@ -1,4 +1,32 @@
-# Gestión Técnica — proyecto Docker
+# Gestión Técnica — Casino & Resort
+
+Sistema web para coordinar el mantenimiento y la operación técnica del parque de máquinas. Centraliza los activos, las intervenciones y el traspaso de pendientes entre turnos, para que el equipo entrante pueda revisar el estado de los trabajos y darles continuidad.
+
+Incluye bitácora de intervenciones, tickets de servicio, inventario y estado de máquinas, plano de sala, mantenimiento preventivo, técnicos, repuestos e insumos, reportes, auditoría y control de acceso por roles.
+
+## Vistas del sistema
+
+Las siguientes imágenes son ilustraciones de referencia con datos de ejemplo; muestran las principales secciones descritas en la [guía completa del sistema](docs/Guia_Completa_Gestion_Tecnica.pdf).
+
+### Dashboard
+
+![Vista ilustrativa del Dashboard](docs/imagenes_manual/dashboard.png)
+
+### Bitácora de intervenciones
+
+![Vista ilustrativa de la Bitácora](docs/imagenes_manual/bitacora.png)
+
+### Inventario de máquinas
+
+![Vista ilustrativa del inventario de máquinas](docs/imagenes_manual/maquinas.png)
+
+### Mantenimiento preventivo
+
+![Vista ilustrativa de mantenimiento preventivo](docs/imagenes_manual/mantenimiento.png)
+
+## Tecnologías
+
+React + TypeScript + Vite, FastAPI + SQLAlchemy y PostgreSQL 16. Docker Compose ejecuta los servicios de frontend, API y base de datos.
 
 | Servicio | Tecnología | URL |
 |---|---|---|
