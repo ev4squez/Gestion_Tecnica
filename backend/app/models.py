@@ -13,6 +13,8 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String(100))
     role: Mapped[str] = mapped_column(String(20))  # ADMIN|JEFE|SUPERVISOR|TECNICO|CONSULTA
     technician_id: Mapped[int | None] = mapped_column(ForeignKey("technicians.id"), unique=True)
+    avatar_data: Mapped[bytes | None] = mapped_column(LargeBinary)
+    avatar_content_type: Mapped[str | None] = mapped_column(String(30))
     technician = relationship("Technician")
 
 class FloorPlan(Base):
@@ -109,6 +111,31 @@ class MachineStatusHistory(Base):
     downtime_end: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
     downtime_minutes: Mapped[int | None] = mapped_column(Integer)
 
+class PreventiveMaintenancePlan(Base):
+    __tablename__ = "preventive_maintenance_plans"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    machine_id: Mapped[int] = mapped_column(ForeignKey("machines.id"), index=True)
+    title: Mapped[str] = mapped_column(String(160))
+    description: Mapped[str] = mapped_column(Text, default="")
+    interval_days: Mapped[int] = mapped_column(Integer)
+    next_due_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), index=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    notified_for_due_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=now)
+    created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    machine = relationship("Machine")
+
+class PreventiveMaintenanceLog(Base):
+    __tablename__ = "preventive_maintenance_logs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    plan_id: Mapped[int] = mapped_column(ForeignKey("preventive_maintenance_plans.id"), index=True)
+    machine_id: Mapped[int] = mapped_column(ForeignKey("machines.id"), index=True)
+    due_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    technician: Mapped[str | None] = mapped_column(String(120))
+    notes: Mapped[str] = mapped_column(Text, default="")
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
 class Ticket(Base):
     __tablename__ = "tickets"
     id: Mapped[int] = mapped_column(primary_key=True)
@@ -123,6 +150,7 @@ class Ticket(Base):
     priority: Mapped[str] = mapped_column(String(10), default="NORMAL")
     sla_due_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     sla_overdue_notified_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    sla_approaching_notified_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     jira_number: Mapped[str | None] = mapped_column(String(30))
     result: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -180,6 +208,18 @@ class Intervention(Base):
     created_by: Mapped[int] = mapped_column(ForeignKey("users.id"))
     machine = relationship("Machine")
     area = relationship("Area")
+    follow_ups = relationship("InterventionFollowUp", order_by="InterventionFollowUp.id")
+
+class InterventionFollowUp(Base):
+    """Append-only shift handoff and resolution notes for an intervention."""
+    __tablename__ = "intervention_follow_ups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    intervention_id: Mapped[int] = mapped_column(ForeignKey("interventions.id"), index=True)
+    status: Mapped[str] = mapped_column(String(20))  # PENDIENTE|RECIBIDA|RESUELTA
+    note: Mapped[str] = mapped_column(Text, default="")
+    at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    user = relationship("User")
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"

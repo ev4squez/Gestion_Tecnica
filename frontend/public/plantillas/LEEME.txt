@@ -1,0 +1,12 @@
+PLANTILLAS PARA LA CARGA MASIVA DE INVENTARIO
+
+Cada archivo es un CSV separado por punto y coma y guardado en UTF-8. Puedes abrirlo con Excel o LibreOffice, reemplazar las filas de ejemplo y guardarlo nuevamente como CSV UTF-8.
+
+Columnas:
+- codigo: obligatorio, único en el inventario.
+- nombre: obligatorio.
+- categoria, marca, modelo, ubicacion, proveedor: opcionales.
+- stock_inicial y stock_minimo: enteros iguales o mayores que cero; vacíos equivalen a cero.
+- costo_unitario: número igual o mayor que cero, sin separador de miles; puede usar coma decimal.
+
+La carga agrega artículos nuevos. Los códigos ya registrados se omiten y nunca se actualiza el stock ni el historial de un artículo existente. Los artículos creados con stock inicial mayor que cero reciben un movimiento de entrada para mantener la trazabilidad.

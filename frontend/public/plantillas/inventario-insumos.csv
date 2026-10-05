@@ -1,0 +1,3 @@
+codigo;nombre;categoria;marca;modelo;stock_inicial;stock_minimo;ubicacion;costo_unitario;proveedor
+INS-001;Guantes de nitrilo;Seguridad;Protec;Talla L;40;10;Bodega central;250;Proveedor Ejemplo
+INS-002;Paños de limpieza;Aseo;Limpio;Microfibra;25;5;Estante A1;890;Aseo Ejemplo

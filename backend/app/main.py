@@ -1,4 +1,4 @@
-import os, json, datetime as dt, io, re, unicodedata, asyncio, logging, base64, hashlib, hmac
+import os, json, datetime as dt, io, re, unicodedata, asyncio, logging, base64, hashlib, hmac, csv, math
 import html as html_lib
 import smtplib, ssl
 from email.message import EmailMessage
@@ -8,14 +8,15 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form
-from fastapi.responses import Response
+from fastapi import FastAPI, Depends, HTTPException, Query, UploadFile, File, Form, Request
+from fastapi.responses import Response, JSONResponse
 import jwt
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
 from pydantic import Field
-from sqlalchemy import select, func, inspect, case, delete, or_
-from sqlalchemy.orm import Session
+from sqlalchemy import select, func, inspect, case, delete, or_, and_
+from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.exc import IntegrityError
 from .db import Base, engine, get_db, SessionLocal
 from .models import *
 from .security import hash_pw, check_pw, make_token, make_password_reset_token, require, current_user
@@ -27,6 +28,20 @@ TICKET_SLA_HOURS = {"CRÍTICA": 5, "ALTA": 24, "NORMAL": 120, "BAJA": 168}
 
 app = FastAPI(title="Gestión Técnica API", version="0.1.0")
 logger = logging.getLogger(__name__)
+
+@app.middleware("http")
+async def log_unhandled_request_errors(request: Request, call_next):
+    try:
+        return await call_next(request)
+    except Exception:
+        logger.exception("Error no controlado en %s %s", request.method, request.url.path)
+        raise
+
+@app.exception_handler(Exception)
+async def log_unhandled_api_errors(request: Request, exc: Exception):
+    logger.error("Excepción no controlada en %s %s", request.method, request.url.path,
+                 exc_info=(type(exc), exc, exc.__traceback__))
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
 def purge_expired_ticket_attachments():
     cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=7)
@@ -65,7 +80,7 @@ def render_floorplan(pdf_data: bytes) -> bytes:
     except Exception as exc:
         raise ValueError(f"No se pudo procesar la primera página del PDF: {exc}") from exc
 
-LEGACY_TABLES = set(Base.metadata.tables) - {"ticket_comments", "floor_plans", "ticket_attachments", "email_settings"}
+LEGACY_TABLES = set(Base.metadata.tables) - {"ticket_comments", "floor_plans", "ticket_attachments", "email_settings", "preventive_maintenance_plans", "preventive_maintenance_logs", "intervention_follow_ups"}
 
 def migrate_schema():
     config = Config(str(Path(__file__).resolve().parents[1] / "alembic.ini"))
@@ -82,8 +97,8 @@ def migrate_schema():
             inspector = inspect(engine)
             missing_columns = []
             migrated_columns = {"interventions": {"island", "jira_number", "pending"},
-                                "users": {"technician_id"},
-                                "tickets": {"sla_due_at", "sla_overdue_notified_at"},
+                                "users": {"technician_id", "avatar_data", "avatar_content_type"},
+                                "tickets": {"sla_due_at", "sla_overdue_notified_at", "sla_approaching_notified_at"},
                                 "machines": {"position_x", "position_y"}}
             for table_name in sorted(LEGACY_TABLES):
                 present = {column["name"] for column in inspector.get_columns(table_name)}
@@ -270,12 +285,51 @@ def notify_overdue_sla_tickets():
 async def sla_overdue_notification_worker():
     while True:
         try:
-            sent = await asyncio.to_thread(notify_overdue_sla_tickets)
-            if sent:
-                logger.info("Enviados %s avisos de SLA vencido", sent)
+            sent = await asyncio.to_thread(notify_sla_tickets)
+            maintenance_sent = await asyncio.to_thread(notify_due_maintenance_plans)
+            if sent: logger.info("Enviados %s avisos de SLA", sent)
+            if maintenance_sent: logger.info("Enviados %s avisos de mantenimiento preventivo", maintenance_sent)
         except Exception:
             logger.exception("No se pudieron enviar los avisos de SLA vencido")
         await asyncio.sleep(15 * 60)
+
+def notify_sla_tickets():
+    now_ = dt.datetime.now(dt.timezone.utc)
+    with SessionLocal() as db:
+        approaching = db.scalars(select(Ticket).where(
+            Ticket.status.notin_({"RESUELTO", "CERRADO", "CANCELADO"}),
+            Ticket.sla_due_at > now_, Ticket.sla_due_at <= now_ + dt.timedelta(hours=24),
+            Ticket.sla_approaching_notified_at.is_(None)).limit(100).with_for_update(skip_locked=True)).all()
+        sent = 0
+        for ticket in approaching:
+            if send_ticket_notification(f"SLA próximo a vencer · Ticket #{ticket.id}",
+                f"El ticket #{ticket.id} vencerá dentro de las próximas 24 horas.\nTarea: {ticket.task}\nPrioridad: {ticket.priority}\nVencimiento: {ticket.sla_due_at:%d/%m/%Y %H:%M UTC}\nTécnico: {ticket.technician or 'Sin asignar'}"):
+                ticket.sla_approaching_notified_at = now_
+                db.add(AuditLog(action="NOTIFICACION_SLA_PROXIMO", entity=f"ticket:{ticket.id}",
+                    new_value=json.dumps({"sla_due_at": ticket.sla_due_at.isoformat()})))
+                sent += 1
+        db.commit()
+    return sent + notify_overdue_sla_tickets()
+
+def notify_due_maintenance_plans():
+    now_ = dt.datetime.now(dt.timezone.utc)
+    with SessionLocal() as db:
+        plans = db.scalars(select(PreventiveMaintenancePlan).where(
+            PreventiveMaintenancePlan.active.is_(True),
+            PreventiveMaintenancePlan.next_due_at <= now_ + dt.timedelta(days=3),
+            PreventiveMaintenancePlan.notified_for_due_at.is_distinct_from(PreventiveMaintenancePlan.next_due_at))
+            .order_by(PreventiveMaintenancePlan.next_due_at).limit(100).with_for_update(skip_locked=True)).all()
+        sent = 0
+        for plan in plans:
+            due = plan.next_due_at
+            if send_ticket_notification(f"Mantenimiento preventivo · Máquina {plan.machine.number}",
+                f"Plan: {plan.title}\nMáquina: {plan.machine.number}\nVencimiento: {due:%d/%m/%Y}\nDescripción: {plan.description or '—'}"):
+                plan.notified_for_due_at = due
+                db.add(AuditLog(action="NOTIFICACION_MANTENIMIENTO", entity=f"maintenance:{plan.id}",
+                    new_value=json.dumps({"due_at": due.isoformat()})))
+                sent += 1
+        db.commit()
+        return sent
 
 @app.get("/health")
 def health(): return {"ok": True}
@@ -320,7 +374,49 @@ def register_user(payload: UserRegistration, db: Session = Depends(get_db)):
 def auth_me(u: User = Depends(current_user)):
     return {"id": u.id, "email": u.username, "full_name": u.full_name, "role": u.role,
             "technician_id": u.technician_id,
+            "has_avatar": bool(u.avatar_data),
             "technician_name": (f"{u.technician.first_name} {u.technician.last_name}" if u.technician else None)}
+
+@app.get("/auth/me/avatar")
+def get_my_avatar(u: User = Depends(current_user)):
+    if not u.avatar_data or not u.avatar_content_type:
+        raise HTTPException(404, "No has cargado una foto de perfil")
+    return Response(content=u.avatar_data, media_type=u.avatar_content_type,
+                    headers={"Cache-Control": "private, no-store"})
+
+@app.put("/auth/me/avatar")
+async def update_my_avatar(file: UploadFile = File(...), db: Session = Depends(get_db),
+                          u: User = Depends(current_user)):
+    allowed_signatures = {
+        "image/jpeg": (b"\xff\xd8\xff",),
+        "image/png": (b"\x89PNG\r\n\x1a\n",),
+        "image/webp": (b"RIFF",),
+    }
+    content_type = (file.content_type or "").lower()
+    if content_type not in allowed_signatures:
+        raise HTTPException(415, "Usa una imagen JPG, PNG o WebP")
+    image = await file.read(2 * 1024 * 1024 + 1)
+    if len(image) > 2 * 1024 * 1024:
+        raise HTTPException(413, "La imagen supera el límite de 2 MB")
+    valid_signature = any(image.startswith(signature) for signature in allowed_signatures[content_type])
+    if content_type == "image/webp":
+        valid_signature = valid_signature and image[8:12] == b"WEBP"
+    if not valid_signature:
+        raise HTTPException(415, "El archivo no coincide con el formato de imagen indicado")
+    u.avatar_data = image
+    u.avatar_content_type = content_type
+    audit(db, u, "ACTUALIZAR_AVATAR", f"user:{u.id}", None,
+          {"content_type": content_type, "size": len(image)})
+    db.commit()
+    return {"has_avatar": True}
+
+@app.delete("/auth/me/avatar")
+def delete_my_avatar(db: Session = Depends(get_db), u: User = Depends(current_user)):
+    u.avatar_data = None
+    u.avatar_content_type = None
+    audit(db, u, "ELIMINAR_AVATAR", f"user:{u.id}")
+    db.commit()
+    return {"has_avatar": False}
 
 class PasswordRecoveryIn(BaseModel):
     email: str
@@ -656,6 +752,157 @@ def create_part(p: PartIn, db: Session = Depends(get_db), u=Depends(require("JEF
     db.commit()
     return part_dict(part)
 
+PART_CSV_HEADERS = {
+    "codigo": "code", "nombre": "name", "categoria": "category", "marca": "brand",
+    "modelo": "model", "stock_inicial": "initial_stock", "existencia_inicial": "initial_stock",
+    "stock_minimo": "minimum_stock", "minimo": "minimum_stock", "ubicacion": "location",
+    "costo_unitario": "unit_cost", "costo": "unit_cost", "proveedor": "supplier",
+}
+PART_CSV_LIMIT_BYTES = 5 * 1024 * 1024
+PART_CSV_LIMIT_ROWS = 1000
+
+def normalize_part_csv_header(value: str) -> str:
+    value = unicodedata.normalize("NFKD", value.strip().lower())
+    value = "".join(char for char in value if not unicodedata.combining(char))
+    return re.sub(r"[\s-]+", "_", value)
+
+def parse_part_csv(data: bytes, inventory_type: str, db: Session):
+    if len(data) > PART_CSV_LIMIT_BYTES:
+        raise HTTPException(413, "El archivo CSV supera el límite de 5 MB")
+    try:
+        content = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        try:
+            content = data.decode("cp1252")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(422, "El archivo debe estar guardado como CSV UTF-8") from exc
+    if not content.strip():
+        raise HTTPException(422, "El archivo CSV está vacío")
+    try:
+        header_line = content.splitlines()[0]
+        delimiter = max((";", ",", "\t"), key=header_line.count)
+        if header_line.count(delimiter) == 0:
+            raise HTTPException(422, "No se detectó un separador CSV válido")
+        reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+        headers = next(reader)
+        rows = list(reader)
+    except (csv.Error, IndexError, StopIteration) as exc:
+        raise HTTPException(422, "No se pudo leer el CSV. Descarga y usa la plantilla de ejemplo") from exc
+    field_indexes = {}
+    for index, header in enumerate(headers):
+        field = PART_CSV_HEADERS.get(normalize_part_csv_header(header))
+        if field and field not in field_indexes:
+            field_indexes[field] = index
+    missing = [label for field, label in (("code", "codigo"), ("name", "nombre"))
+               if field not in field_indexes]
+    if missing:
+        raise HTTPException(422, f"Faltan columnas obligatorias: {', '.join(missing)}")
+
+    records, errors, seen_codes = [], [], set()
+    nonempty_count = 0
+    for row_number, values in enumerate(rows, start=2):
+        if not any((value or "").strip() for value in values):
+            continue
+        nonempty_count += 1
+        if nonempty_count > PART_CSV_LIMIT_ROWS:
+            raise HTTPException(413, f"El archivo supera el máximo de {PART_CSV_LIMIT_ROWS} filas")
+        raw = {field: (values[index].strip() if index < len(values) else "")
+               for field, index in field_indexes.items()}
+        code = raw.get("code", "").strip().upper()
+        name = raw.get("name", "").strip()
+        problems = []
+        if not code: problems.append("Falta el código")
+        elif len(code) > 50: problems.append("El código supera 50 caracteres")
+        if not name: problems.append("Falta el nombre")
+        elif len(name) > 160: problems.append("El nombre supera 160 caracteres")
+        values_out = {"code": code, "name": name, "inventory_type": inventory_type}
+        limits = {"category": 80, "brand": 80, "model": 80, "location": 120, "supplier": 120}
+        for field, limit in limits.items():
+            value = raw.get(field, "").strip() or None
+            if value and len(value) > limit: problems.append(f"{field}: máximo {limit} caracteres")
+            values_out[field] = value
+        for field, label in (("initial_stock", "stock inicial"), ("minimum_stock", "stock mínimo")):
+            value = raw.get(field, "").strip() or "0"
+            if not re.fullmatch(r"\d+", value):
+                problems.append(f"{label}: usa un entero igual o mayor que cero")
+                values_out[field] = 0
+            else:
+                values_out[field] = int(value)
+        raw_cost = raw.get("unit_cost", "").strip()
+        if raw_cost:
+            cost_value = raw_cost.replace(" ", "")
+            if "," in cost_value and "." in cost_value:
+                cost_value = cost_value.replace(".", "").replace(",", ".")
+            elif "," in cost_value:
+                cost_value = cost_value.replace(",", ".")
+            try:
+                cost = float(cost_value)
+                if not math.isfinite(cost) or cost < 0: raise ValueError
+                values_out["unit_cost"] = cost
+            except ValueError:
+                problems.append("costo unitario: usa un número igual o mayor que cero")
+                values_out["unit_cost"] = None
+        else:
+            values_out["unit_cost"] = None
+        if code and code in seen_codes:
+            problems.append("El código está repetido dentro del archivo")
+        elif code:
+            seen_codes.add(code)
+        if problems:
+            errors.append({"row": row_number, "code": code or None, "reason": "; ".join(problems)})
+        else:
+            records.append({"row": row_number, **values_out})
+
+    existing = set()
+    codes = [record["code"] for record in records]
+    if codes:
+        existing = {code.strip().upper() for code in db.scalars(select(Part.code).where(func.upper(func.trim(Part.code)).in_(codes))).all()}
+    skipped = [{"row": record["row"], "code": record["code"]}
+               for record in records if record["code"] in existing]
+    valid = [record for record in records if record["code"] not in existing]
+    return {"total_rows": nonempty_count, "valid": valid, "skipped": skipped, "errors": errors}
+
+@app.post("/parts/import")
+async def import_parts_csv(file: UploadFile = File(...), inventory_type: str = Form(...),
+                          preview: bool = Form(True), db: Session = Depends(get_db),
+                          u=Depends(require("JEFE"))):
+    if inventory_type not in {"REPUESTO", "INSUMO"}:
+        raise HTTPException(422, "Tipo de inventario inválido")
+    if not file.filename or not file.filename.lower().endswith(".csv"):
+        raise HTTPException(422, "Selecciona un archivo con extensión .csv")
+    content = await file.read(PART_CSV_LIMIT_BYTES + 1)
+    parsed = parse_part_csv(content, inventory_type, db)
+    summary = {"total_rows": parsed["total_rows"], "valid_count": len(parsed["valid"]),
+               "skipped_count": len(parsed["skipped"]), "skipped": parsed["skipped"][:30],
+               "error_count": len(parsed["errors"]), "errors": parsed["errors"][:30],
+               "sample": [{key: value for key, value in row.items() if key != "row"}
+                          for row in parsed["valid"][:10]]}
+    if preview:
+        return {"preview": True, **summary}
+    if not parsed["valid"]:
+        raise HTTPException(422, "No hay filas nuevas válidas para cargar")
+    created = []
+    try:
+        for values in parsed["valid"]:
+            row = {key: value for key, value in values.items() if key != "row"}
+            initial_stock = row.pop("initial_stock")
+            part = Part(**row, stock=initial_stock)
+            db.add(part)
+            db.flush()
+            if initial_stock:
+                db.add(PartMovement(part_id=part.id, movement_type="ENTRADA", quantity=initial_stock,
+                                    stock_after=initial_stock, user_id=u.id, notes="Stock inicial · carga CSV"))
+            audit(db, u, "CARGA_CSV_INSUMO" if inventory_type == "INSUMO" else "CARGA_CSV_REPUESTO",
+                  f"part:{part.id}", None, row | {"stock": initial_stock})
+            created.append(part.code)
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        raise HTTPException(409, "Uno o más códigos se registraron mientras se procesaba el archivo. Vuelve a cargar para actualizar la vista previa") from exc
+    return {"preview": False, "created_count": len(created), "created": created,
+            "skipped_count": len(parsed["skipped"]), "skipped": parsed["skipped"][:30],
+            "error_count": len(parsed["errors"]), "errors": parsed["errors"][:30]}
+
 class PartMovementIn(BaseModel):
     movement_type: str
     quantity: int
@@ -863,7 +1110,9 @@ def bulk_delete_machines(payload: MachineBulkDeleteIn, db: Session = Depends(get
             continue
         references = []
         for label, model in (("tickets", Ticket), ("intervenciones", Intervention),
-                             ("historial de estados", MachineStatusHistory), ("movimientos de repuestos", PartMovement)):
+                             ("historial de estados", MachineStatusHistory), ("movimientos de repuestos", PartMovement),
+                             ("planes preventivos", PreventiveMaintenancePlan),
+                             ("historial preventivo", PreventiveMaintenanceLog)):
             if db.scalar(select(model.id).where(model.machine_id == machine.id).limit(1)) is not None:
                 references.append(label)
         if references:
@@ -1115,7 +1364,7 @@ def history(number: str, db: Session = Depends(get_db), _=Depends(staff_user)):
                              .order_by(MachineStatusHistory.at.desc())).all()
     movement_rows = db.scalars(select(PartMovement).where(PartMovement.machine_id == m.id)
                                .order_by(PartMovement.at.desc())).all()
-    intervention_rows = db.scalars(select(Intervention).where(or_(
+    intervention_rows = db.scalars(select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user)).where(or_(
                                    Intervention.machine_id == m.id,
                                    (Intervention.machine_id.is_(None)) &
                                    Intervention.ticket_id.in_(select(Ticket.id).where(Ticket.machine_id == m.id))))
@@ -1131,7 +1380,8 @@ def history(number: str, db: Session = Depends(get_db), _=Depends(staff_user)):
                         for r in movement_rows)
     history_rows.extend({"type": "intervencion", "at": r.occurred_at,
                          "work_type": r.work_type, "task": r.task, "detail": r.detail,
-                         "technician": r.technician, "shift": r.shift, "pending": r.pending,
+                         "technician": r.technician, "shift": r.shift,
+                         "pending": r.follow_ups[-1].status != "RESUELTA" if r.follow_ups else r.pending,
                          "result": r.result, "notes": r.notes, "ticket_id": r.ticket_id,
                          "jira_number": r.jira_number, "area": r.area.name if r.area else None}
                         for r in intervention_rows)
@@ -1199,7 +1449,6 @@ async def create_ticket(task: str = Form(...), detail: str = Form(""), machine: 
     if status not in TICKET_STATES: raise HTTPException(422, "Estado de ticket inválido")
     if priority not in TICKET_PRIORITIES: raise HTTPException(422, "Prioridad inválida")
     mid = None
-    machine = None
     machine_value = (machine or "").strip()
     if machine_value:
         m = db.scalar(select(Machine).where(Machine.number == machine_value))
@@ -1220,8 +1469,11 @@ async def create_ticket(task: str = Form(...), detail: str = Form(""), machine: 
           {"task": task.strip(), "detail": detail.strip(), "machine": machine_value or None,
            "attachments": len(image_payloads)})
     db.commit()
-    send_ticket_notification(f"Nuevo ticket #{tk.id}: {tk.task}",
-                             f"Se registró una nueva solicitud.\nSolicitante: {u.full_name or u.username}\nTarea: {tk.task}\nMáquina: {machine_value or 'No indicada'}\n\nIngresa a Gestión Técnica para revisarla.")
+    try:
+        send_ticket_notification(f"Nuevo ticket #{tk.id}: {tk.task}",
+                                 f"Se registró una nueva solicitud.\nSolicitante: {u.full_name or u.username}\nTarea: {tk.task}\nMáquina: {machine_value or 'No indicada'}\n\nIngresa a Gestión Técnica para revisarla.")
+    except Exception:
+        logger.exception("El ticket #%s se guardó, pero falló la notificación por correo", tk.id)
     return {"id": tk.id}
 
 @app.get("/tickets/{ticket_id}/attachments/{attachment_id}")
@@ -1239,12 +1491,31 @@ def get_ticket_attachment(ticket_id: int, attachment_id: int, db: Session = Depe
 
 @app.get("/tickets")
 def list_tickets(status: str | None = None, priority: str | None = None, search_text: str | None = None,
+                 attention: str | None = None,
                  page: int = Query(1, ge=1), size: int = Query(25, le=100),
                  db: Session = Depends(get_db), u=Depends(current_user)):
     query = select(Ticket)
     if u.role == "USUARIO": query = query.where(Ticket.created_by == u.id)
     if status: query = query.where(Ticket.status == status)
     if priority: query = query.where(Ticket.priority == priority)
+    open_tickets = Ticket.status.notin_({"RESUELTO", "CERRADO", "CANCELADO"})
+    if attention == "overdue":
+        query = query.where(open_tickets, Ticket.sla_due_at.is_not(None),
+                            Ticket.sla_due_at <= dt.datetime.now(dt.timezone.utc))
+    elif attention == "unassigned":
+        query = query.where(open_tickets, (Ticket.technician.is_(None)) | (func.trim(Ticket.technician) == ""))
+    elif attention == "urgent":
+        query = query.where(open_tickets, Ticket.priority.in_({"CRÍTICA", "ALTA"}))
+    elif attention == "under_24h":
+        query = query.where(open_tickets, Ticket.created_at > dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24))
+    elif attention == "24_to_72h":
+        attention_now = dt.datetime.now(dt.timezone.utc)
+        query = query.where(open_tickets, Ticket.created_at <= attention_now - dt.timedelta(hours=24),
+                            Ticket.created_at > attention_now - dt.timedelta(hours=72))
+    elif attention == "over_72h":
+        query = query.where(open_tickets, Ticket.created_at <= dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=72))
+    elif attention == "over_24h":
+        query = query.where(open_tickets, Ticket.created_at <= dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24))
     if search_text:
         term = f"%{search_text.strip()}%"
         query = query.where((Ticket.task.ilike(term)) | (Ticket.detail.ilike(term)) | (Ticket.technician.ilike(term)) | (Ticket.jira_number.ilike(term)))
@@ -1259,6 +1530,21 @@ def get_ticket(ticket_id: int, db: Session = Depends(get_db), u=Depends(current_
         raise HTTPException(404, "Ticket no existe")
     return ticket_dict(ticket)
 
+@app.get("/tickets/{ticket_id}/inventory")
+def ticket_inventory_usage(ticket_id: int, db: Session = Depends(get_db), _=Depends(staff_user)):
+    if not db.get(Ticket, ticket_id): raise HTTPException(404, "Ticket no existe")
+    rows = db.scalars(select(PartMovement).options(selectinload(PartMovement.part)).where(
+        PartMovement.ticket_id == ticket_id, PartMovement.movement_type == "CONSUMO")
+        .order_by(PartMovement.at.desc(), PartMovement.id.desc()).limit(100)).all()
+    return [{"id": row.id, "at": row.at, "code": row.part.code, "name": row.part.name,
+             "inventory_type": row.part.inventory_type, "quantity": abs(row.quantity),
+             "stock_after": row.stock_after, "technician": row.technician, "notes": row.notes}
+            for row in rows]
+
+class InventoryUseIn(BaseModel):
+    part_id: int = Field(gt=0)
+    quantity: int = Field(gt=0, le=1000000)
+
 class TicketUpdate(BaseModel):
     status: str | None = None
     priority: str | None = None
@@ -1266,6 +1552,51 @@ class TicketUpdate(BaseModel):
     shift: str | None = None
     result: str | None = None
     note: str | None = None
+    parts_used: list[InventoryUseIn] = Field(default_factory=list, max_length=100)
+
+def lock_inventory_for_usage(lines: list[InventoryUseIn], db: Session):
+    part_ids = [line.part_id for line in lines]
+    if len(part_ids) != len(set(part_ids)):
+        raise HTTPException(422, "No repitas el mismo artículo; suma las cantidades en una sola línea")
+    if not part_ids:
+        return {}
+    parts = {part.id: part for part in db.scalars(
+        select(Part).where(Part.id.in_(part_ids)).order_by(Part.id).with_for_update()).all()}
+    missing = [str(part_id) for part_id in part_ids if part_id not in parts]
+    if missing:
+        raise HTTPException(422, f"Artículo(s) de inventario no existe(n): {', '.join(missing)}")
+    for line in lines:
+        part = parts[line.part_id]
+        if line.quantity > part.stock:
+            raise HTTPException(409, f"Stock insuficiente para {part.code} · {part.name}: disponibles {part.stock}, solicitados {line.quantity}")
+    return parts
+
+def record_inventory_usage(lines: list[InventoryUseIn], parts: dict, db: Session, user: User,
+                           *, ticket_id: int | None, machine_id: int | None, technician: str | None,
+                           reference: str, audit_action: str):
+    low_stock_notifications = []
+    for line in lines:
+        part = parts[line.part_id]
+        old_stock = part.stock
+        part.stock -= line.quantity
+        db.add(PartMovement(part_id=part.id, movement_type="CONSUMO", quantity=-line.quantity,
+                            stock_after=part.stock, user_id=user.id, ticket_id=ticket_id,
+                            machine_id=machine_id, technician=technician or user.full_name or user.username,
+                            notes=reference[:4000]))
+        audit(db, user, audit_action, f"part:{part.id}", {"stock": old_stock},
+              {"stock": part.stock, "quantity": line.quantity, "ticket_id": ticket_id,
+               "machine_id": machine_id, "inventory_type": part.inventory_type})
+        if old_stock > part.minimum_stock >= part.stock:
+            low_stock_notifications.append((part.code, part.name, part.stock, part.minimum_stock))
+    return low_stock_notifications
+
+def notify_inventory_below_minimum(notifications: list[tuple[str, str, int, int]]):
+    for code, name, stock, minimum in notifications:
+        try:
+            send_ticket_notification(f"Inventario bajo mínimo: {name}",
+                                     f"El artículo {code} ({name}) quedó con {stock} unidades; mínimo configurado: {minimum}.")
+        except Exception:
+            logger.exception("No se pudo notificar stock bajo mínimo para %s", code)
 
 @app.patch("/tickets/{ticket_id}")
 def update_ticket(ticket_id: int, update: TicketUpdate, db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
@@ -1273,6 +1604,8 @@ def update_ticket(ticket_id: int, update: TicketUpdate, db: Session = Depends(ge
     if not ticket: raise HTTPException(404, "Ticket no existe")
     values = update.model_dump(exclude_unset=True)
     note = values.pop("note", None)
+    parts_used = values.pop("parts_used", [])
+    inventory_parts = lock_inventory_for_usage(parts_used, db)
     if "status" in values and values["status"] not in TICKET_STATES: raise HTTPException(422, "Estado de ticket inválido")
     if "priority" in values and values["priority"] not in TICKET_PRIORITIES: raise HTTPException(422, "Prioridad inválida")
     if values.get("status") in {"RESUELTO", "CERRADO"} and values["status"] != ticket.status:
@@ -1280,21 +1613,122 @@ def update_ticket(ticket_id: int, update: TicketUpdate, db: Session = Depends(ge
         if not resolution or not resolution.strip():
             raise HTTPException(422, "Registra la solución o causa antes de resolver o cerrar el ticket")
     old = {key: getattr(ticket, key) for key in values}
+    old_technician = ticket.technician
     if "priority" in values and values["priority"] != ticket.priority and ticket.sla_due_at:
         old["sla_due_at"] = ticket.sla_due_at
         values["sla_due_at"] = ticket.created_at + dt.timedelta(hours=TICKET_SLA_HOURS[values["priority"]])
+        ticket.sla_approaching_notified_at = None
+        ticket.sla_overdue_notified_at = None
     if values.get("status") and values["status"] != ticket.status:
         db.add(TicketStatusHistory(ticket_id=ticket.id, old_status=ticket.status, new_status=values["status"], user_id=u.id, note=note))
     for key, value in values.items():
         if isinstance(value, str): value = value.strip() or None
         setattr(ticket, key, value)
+    low_stock_notifications = record_inventory_usage(
+        parts_used, inventory_parts, db, u, ticket_id=ticket.id,
+        machine_id=ticket.machine_id, technician=ticket.technician,
+        reference=f"Consumo para Ticket #{ticket.id} · {ticket.task}",
+        audit_action="CONSUMO_INVENTARIO_DESDE_TICKET")
     audit(db, u, "ACTUALIZAR_TICKET", f"ticket:{ticket.id}", old, values)
     db.commit()
+    notify_inventory_below_minimum(low_stock_notifications)
+    if ticket.technician and ticket.technician != old_technician:
+        technician = db.scalar(select(Technician).where(
+            func.lower(func.trim(Technician.first_name + " " + Technician.last_name)) == ticket.technician.lower().strip()))
+        account = db.scalar(select(User).where(User.technician_id == technician.id)) if technician else None
+        recipient = account.username if account and re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", account.username) else None
+        if recipient:
+            send_system_email([recipient], f"Ticket asignado · #{ticket.id}",
+                f"Se te asignó el ticket #{ticket.id}.\nTarea: {ticket.task}\nPrioridad: {ticket.priority}\nVencimiento SLA: {ticket.sla_due_at:%d/%m/%Y %H:%M UTC}" if ticket.sla_due_at else f"Se te asignó el ticket #{ticket.id}.\nTarea: {ticket.task}\nPrioridad: {ticket.priority}")
     if "status" in values and values["status"] != old.get("status"):
         requester = db.get(User, ticket.created_by)
         send_system_email([requester.username] if requester else [], f"Actualización del ticket #{ticket.id}",
                           f"El estado de tu solicitud '{ticket.task}' cambió a {ticket.status}.\n{note or ''}")
     return ticket_dict(ticket)
+
+class MaintenancePlanIn(BaseModel):
+    machine_number: str | None = Field(default=None, min_length=1, max_length=20)
+    machine_numbers: list[str] = Field(default_factory=list)
+    title: str = Field(min_length=1, max_length=160)
+    description: str = Field(default="", max_length=4000)
+    interval_days: int = Field(ge=1, le=3650)
+    next_due_at: dt.date
+
+class MaintenanceCompleteIn(BaseModel):
+    technician: str = Field(default="", max_length=120)
+    notes: str = Field(default="", max_length=4000)
+
+def maintenance_plan_dict(plan: PreventiveMaintenancePlan):
+    return {"id": plan.id, "machine_number": plan.machine.number, "machine_id": plan.machine_id,
+            "island": plan.machine.island.number if plan.machine.island else None,
+            "title": plan.title, "description": plan.description, "interval_days": plan.interval_days,
+            "next_due_at": plan.next_due_at, "active": plan.active, "created_at": plan.created_at}
+
+@app.get("/maintenance/plans")
+def list_maintenance_plans(db: Session = Depends(get_db), _=Depends(staff_user)):
+    plans = db.scalars(select(PreventiveMaintenancePlan).order_by(
+        PreventiveMaintenancePlan.active.desc(), PreventiveMaintenancePlan.next_due_at)).all()
+    return [maintenance_plan_dict(plan) for plan in plans]
+
+@app.post("/maintenance/plans", status_code=201)
+def create_maintenance_plan(payload: MaintenancePlanIn, db: Session = Depends(get_db), u=Depends(require("JEFE", "SUPERVISOR"))):
+    numbers = list(dict.fromkeys(number.strip() for number in [*payload.machine_numbers, payload.machine_number or ""] if number.strip()))
+    if not numbers: raise HTTPException(422, "Selecciona al menos una máquina")
+    found = db.scalars(select(Machine).where(Machine.number.in_(numbers))).all()
+    machines_by_number = {machine.number: machine for machine in found}
+    missing = [number for number in numbers if number not in machines_by_number]
+    if missing: raise HTTPException(404, f"Máquina(s) no existe(n): {', '.join(missing)}")
+    due = dt.datetime.combine(payload.next_due_at, dt.time(hour=12), tzinfo=dt.timezone.utc)
+    plans = []
+    for number in numbers:
+        machine = machines_by_number[number]
+        plan = PreventiveMaintenancePlan(machine_id=machine.id, title=payload.title.strip(),
+            description=payload.description.strip(), interval_days=payload.interval_days, next_due_at=due, created_by=u.id)
+        db.add(plan); db.flush()
+        audit(db, u, "CREAR_PLAN_MANTENIMIENTO", f"maintenance:{plan.id}", None, maintenance_plan_dict(plan))
+        plans.append(plan)
+    db.commit(); db.refresh(plan)
+    return [maintenance_plan_dict(item) for item in plans]
+
+@app.post("/maintenance/plans/{plan_id}/complete")
+def complete_maintenance_plan(plan_id: int, payload: MaintenanceCompleteIn,
+                              db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
+    plan = db.get(PreventiveMaintenancePlan, plan_id)
+    if not plan: raise HTTPException(404, "Plan no existe")
+    now_ = dt.datetime.now(dt.timezone.utc)
+    previous_due = plan.next_due_at
+    db.add(PreventiveMaintenanceLog(plan_id=plan.id, machine_id=plan.machine_id,
+        due_at=previous_due, completed_at=now_, technician=payload.technician.strip() or u.full_name or u.username,
+        notes=payload.notes.strip(), user_id=u.id))
+    db.add(Intervention(machine_id=plan.machine_id, area_id=plan.machine.area_id,
+        occurred_at=now_, technician=payload.technician.strip() or u.full_name or u.username,
+        work_type="MANTENIMIENTO PREVENTIVO", task=plan.title,
+        detail=payload.notes.strip(), island=plan.machine.island.number if plan.machine.island else "",
+        jira_number="", pending=False, result="Mantenimiento preventivo ejecutado",
+        notes=f"Plan preventivo #{plan.id} · frecuencia {plan.interval_days} días", created_by=u.id))
+    plan.next_due_at = now_ + dt.timedelta(days=plan.interval_days)
+    plan.notified_for_due_at = None
+    audit(db, u, "COMPLETAR_MANTENIMIENTO", f"maintenance:{plan.id}",
+        {"next_due_at": previous_due}, {"completed_at": now_, "next_due_at": plan.next_due_at})
+    db.commit()
+    return maintenance_plan_dict(plan)
+
+@app.patch("/maintenance/plans/{plan_id}/active")
+def set_maintenance_plan_active(plan_id: int, active: bool, db: Session = Depends(get_db), u=Depends(require("JEFE", "SUPERVISOR"))):
+    plan = db.get(PreventiveMaintenancePlan, plan_id)
+    if not plan: raise HTTPException(404, "Plan no existe")
+    old = plan.active; plan.active = active
+    audit(db, u, "CAMBIAR_ESTADO_PLAN_MANTENIMIENTO", f"maintenance:{plan.id}", {"active": old}, {"active": active})
+    db.commit()
+    return maintenance_plan_dict(plan)
+
+@app.get("/maintenance/plans/{plan_id}/history")
+def maintenance_plan_history(plan_id: int, db: Session = Depends(get_db), _=Depends(staff_user)):
+    if not db.get(PreventiveMaintenancePlan, plan_id): raise HTTPException(404, "Plan no existe")
+    rows = db.scalars(select(PreventiveMaintenanceLog).where(PreventiveMaintenanceLog.plan_id == plan_id)
+                      .order_by(PreventiveMaintenanceLog.completed_at.desc())).all()
+    return [{"id": row.id, "due_at": row.due_at, "completed_at": row.completed_at,
+             "technician": row.technician, "notes": row.notes} for row in rows]
 
 @app.get("/tickets/{ticket_id}/history")
 def ticket_history(ticket_id: int, db: Session = Depends(get_db), u=Depends(current_user)):
@@ -1353,6 +1787,9 @@ def add_ticket_comment(ticket_id: int, payload: TicketCommentIn,
 class InterventionIn(BaseModel):
     occurred_at: dt.datetime | None = None
     ticket_id: int | None = None
+    maintenance_plan_id: int | None = None
+    machine_status: str | None = None
+    machine_status_reason: str | None = None
     ticket_status: str | None = None
     ticket_status_note: str | None = None
     machine: str | None = None
@@ -1367,13 +1804,20 @@ class InterventionIn(BaseModel):
     pending: bool = False
     result: str | None = None
     notes: str | None = None
+    parts_used: list[InventoryUseIn] = Field(default_factory=list, max_length=100)
 
 def intervention_dict(i: Intervention):
+    latest_follow_up = i.follow_ups[-1] if i.follow_ups else None
+    pending = latest_follow_up.status != "RESUELTA" if latest_follow_up else i.pending
     return {"id": i.id, "occurred_at": i.occurred_at, "ticket_id": i.ticket_id,
             "machine": i.machine.number if i.machine_id and i.machine else None,
             "area": i.area.name if i.area_id and i.area else None, "technician": i.technician,
             "shift": i.shift, "work_type": i.work_type, "task": i.task, "detail": i.detail,
-            "island": i.island, "jira_number": i.jira_number, "pending": i.pending,
+            "island": i.island, "jira_number": i.jira_number, "pending": pending,
+            "follow_up_status": latest_follow_up.status if latest_follow_up else ("PENDIENTE" if i.pending else "RESUELTA"),
+            "follow_up_note": latest_follow_up.note if latest_follow_up else None,
+            "follow_up_by": (latest_follow_up.user.full_name or latest_follow_up.user.username) if latest_follow_up and latest_follow_up.user else None,
+            "follow_up_at": latest_follow_up.at if latest_follow_up else None,
             "result": i.result, "notes": i.notes}
 
 @app.post("/interventions", status_code=201)
@@ -1389,14 +1833,47 @@ def create_intervention(data: InterventionIn, db: Session = Depends(get_db), u=D
         raise HTTPException(422, "La nota del cambio no puede superar 4000 caracteres")
     machine = db.scalar(select(Machine).where(Machine.number == data.machine)) if data.machine else None
     if data.machine and not machine: raise HTTPException(422, "Máquina no existe")
+    inventory_parts = lock_inventory_for_usage(data.parts_used, db)
     if ticket and ticket.machine_id:
         if machine and machine.id != ticket.machine_id: raise HTTPException(422, "La máquina no coincide con el ticket")
         machine = machine or db.get(Machine, ticket.machine_id)
+    maintenance_plan = db.get(PreventiveMaintenancePlan, data.maintenance_plan_id) if data.maintenance_plan_id else None
+    if data.maintenance_plan_id and not maintenance_plan:
+        raise HTTPException(422, "Plan preventivo no existe")
+    if maintenance_plan:
+        if not data.work_type or "MANTENIMIENTO" not in data.work_type.upper():
+            raise HTTPException(422, "Selecciona un tipo de trabajo de mantenimiento para vincular el plan")
+        if not maintenance_plan.active:
+            raise HTTPException(422, "El plan preventivo está inactivo")
+        if machine and machine.id != maintenance_plan.machine_id:
+            raise HTTPException(422, "El plan seleccionado corresponde a otra máquina")
+        machine = machine or db.get(Machine, maintenance_plan.machine_id)
+    if data.machine_status:
+        if not machine: raise HTTPException(422, "Selecciona una máquina para actualizar su estado")
+        if data.machine_status not in MACHINE_STATES: raise HTTPException(422, "Estado de máquina inválido")
+        if not (data.machine_status_reason or "").strip(): raise HTTPException(422, "Indica el motivo del cambio de estado")
+        if machine.status == data.machine_status: raise HTTPException(422, "La máquina ya tiene ese estado")
     area = db.scalar(select(Area).where(Area.name == data.area)) if data.area else (machine.area if machine else None)
     if data.area and not area: raise HTTPException(422, "Área no existe en el catálogo")
     occurred = data.occurred_at or dt.datetime.now(dt.timezone.utc)
     if occurred.tzinfo is None:
         occurred = occurred.replace(tzinfo=ZoneInfo("America/Santiago")).astimezone(dt.timezone.utc)
+    if machine and data.machine_status:
+        previous_status = machine.status
+        if data.machine_status == "OPERATIVA":
+            open_downtime = db.scalar(select(MachineStatusHistory).where(
+                MachineStatusHistory.machine_id == machine.id,
+                MachineStatusHistory.new_status == "FUERA_DE_SERVICIO",
+                MachineStatusHistory.downtime_end.is_(None)).order_by(MachineStatusHistory.at.desc()))
+            if open_downtime:
+                open_downtime.downtime_end = occurred
+                open_downtime.downtime_minutes = max(0, int((occurred - open_downtime.at).total_seconds() // 60))
+        db.add(MachineStatusHistory(machine_id=machine.id, old_status=previous_status,
+            new_status=data.machine_status, at=occurred, user_id=u.id,
+            reason=data.machine_status_reason.strip(), ticket_id=data.ticket_id))
+        machine.status = data.machine_status
+        audit(db, u, "CAMBIO_ESTADO_DESDE_BITACORA", f"machine:{machine.number}", previous_status,
+            {"status": machine.status, "reason": data.machine_status_reason.strip()})
     item = Intervention(occurred_at=occurred, ticket_id=data.ticket_id,
                         machine_id=machine.id if machine else None, area_id=area.id if area else None,
                         technician=data.technician.strip() if data.technician else None,
@@ -1404,6 +1881,23 @@ def create_intervention(data: InterventionIn, db: Session = Depends(get_db), u=D
                         island=(data.island or "").strip(), jira_number=(data.jira_number or "").strip(),
                         pending=data.pending, result=data.result, notes=data.notes, created_by=u.id)
     db.add(item); db.flush()
+    low_stock_notifications = record_inventory_usage(
+        data.parts_used, inventory_parts, db, u, ticket_id=data.ticket_id,
+        machine_id=machine.id if machine else None,
+        technician=(data.technician or "").strip() or None,
+        reference=f"Consumo en bitácora · Intervención #{item.id} · {data.task.strip()}",
+        audit_action="CONSUMO_INVENTARIO_DESDE_BITACORA")
+    if maintenance_plan:
+        previous_due = maintenance_plan.next_due_at
+        db.add(PreventiveMaintenanceLog(plan_id=maintenance_plan.id, machine_id=maintenance_plan.machine_id,
+            due_at=previous_due, completed_at=occurred,
+            technician=(data.technician or "").strip() or u.full_name or u.username,
+            notes=(data.detail or "").strip() or (data.notes or "").strip(), user_id=u.id))
+        maintenance_plan.next_due_at = occurred + dt.timedelta(days=maintenance_plan.interval_days)
+        maintenance_plan.notified_for_due_at = None
+        audit(db, u, "ACTUALIZAR_PLAN_DESDE_BITACORA", f"maintenance:{maintenance_plan.id}",
+            {"next_due_at": previous_due}, {"completed_at": occurred, "next_due_at": maintenance_plan.next_due_at,
+             "intervention_id": item.id})
     if ticket and data.ticket_status and data.ticket_status != ticket.status:
         old_status = ticket.status
         ticket.status = data.ticket_status
@@ -1416,6 +1910,7 @@ def create_intervention(data: InterventionIn, db: Session = Depends(get_db), u=D
                                         "intervention_id": item.id})
     audit(db, u, "REGISTRAR_INTERVENCION", f"intervention:{item.id}", None, data.model_dump())
     db.commit()
+    notify_inventory_below_minimum(low_stock_notifications)
     return intervention_dict(item)
 
 @app.get("/interventions")
@@ -1425,7 +1920,7 @@ def list_interventions(search_text: str | None = None, machine: str | None = Non
                        work_type: str | None = None, pending_only: bool = False,
                        page: int = Query(1, ge=1), size: int = Query(50, le=200),
                        db: Session = Depends(get_db), _=Depends(staff_user)):
-    query = select(Intervention)
+    query = select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user))
     if search_text:
         term = f"%{search_text.strip()}%"
         query = query.where((Intervention.task.ilike(term)) | (Intervention.detail.ilike(term)) |
@@ -1444,10 +1939,56 @@ def list_interventions(search_text: str | None = None, machine: str | None = Non
     if area: query = query.where(Intervention.area.has(Area.name.ilike(f"%{area.strip()}%")))
     if shift: query = query.where(Intervention.shift == shift)
     if work_type: query = query.where(Intervention.work_type.ilike(f"%{work_type.strip()}%"))
-    if pending_only: query = query.where(Intervention.pending.is_(True))
+    if pending_only:
+        latest_followup = (select(InterventionFollowUp.intervention_id.label("intervention_id"),
+                                  func.max(InterventionFollowUp.id).label("followup_id"))
+                           .group_by(InterventionFollowUp.intervention_id).subquery())
+        query = query.outerjoin(latest_followup, latest_followup.c.intervention_id == Intervention.id)
+        query = query.outerjoin(InterventionFollowUp, InterventionFollowUp.id == latest_followup.c.followup_id)
+        query = query.where(or_(and_(latest_followup.c.followup_id.is_(None), Intervention.pending.is_(True)),
+                                InterventionFollowUp.status.in_({"PENDIENTE", "RECIBIDA"})))
     total = db.scalar(select(func.count()).select_from(query.subquery()))
     rows = db.scalars(query.order_by(Intervention.occurred_at.desc()).offset((page-1)*size).limit(size)).all()
     return {"total": total, "items": [intervention_dict(i) for i in rows]}
+
+class InterventionFollowUpIn(BaseModel):
+    status: str
+    note: str = Field(default="", max_length=4000)
+
+@app.get("/interventions/pending")
+def list_pending_interventions(page: int = Query(1, ge=1), size: int = Query(8, ge=1, le=100),
+                               db: Session = Depends(get_db), _=Depends(staff_user)):
+    latest_followup = (select(InterventionFollowUp.intervention_id.label("intervention_id"),
+                              func.max(InterventionFollowUp.id).label("followup_id"))
+                       .group_by(InterventionFollowUp.intervention_id).subquery())
+    query = (select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user))
+             .outerjoin(latest_followup, latest_followup.c.intervention_id == Intervention.id)
+             .outerjoin(InterventionFollowUp, InterventionFollowUp.id == latest_followup.c.followup_id)
+             .where(or_(and_(latest_followup.c.followup_id.is_(None), Intervention.pending.is_(True)),
+                        InterventionFollowUp.status.in_({"PENDIENTE", "RECIBIDA"}))))
+    total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
+    received_total = db.scalar(select(func.count()).select_from(query.where(
+        InterventionFollowUp.status == "RECIBIDA").subquery())) or 0
+    rows = db.scalars(query.order_by(Intervention.occurred_at.desc()).offset((page-1)*size).limit(size)).all()
+    return {"total": total, "received_total": received_total,
+            "items": [intervention_dict(row) for row in rows]}
+
+@app.post("/interventions/{intervention_id}/follow-ups", status_code=201)
+def add_intervention_follow_up(intervention_id: int, payload: InterventionFollowUpIn,
+                              db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
+    if payload.status not in {"PENDIENTE", "RECIBIDA", "RESUELTA"}:
+        raise HTTPException(422, "El seguimiento debe quedar pendiente, recibido o resuelto")
+    intervention = db.get(Intervention, intervention_id)
+    if not intervention: raise HTTPException(404, "Intervención no existe")
+    previous = intervention_dict(intervention)
+    follow_up = InterventionFollowUp(intervention_id=intervention.id, status=payload.status,
+                                     note=payload.note.strip(), user_id=u.id)
+    db.add(follow_up)
+    audit(db, u, "SEGUIMIENTO_INTERVENCION", f"intervention:{intervention.id}",
+          {"pending": previous["pending"]}, {"status": payload.status, "note": payload.note.strip()})
+    db.commit()
+    db.refresh(intervention)
+    return intervention_dict(intervention)
 
 class DailyReportIn(BaseModel):
     report_date: dt.date
@@ -1461,14 +2002,49 @@ def daily_report_data(report_date: dt.date, shift: str | None, db: Session):
     local_tz = ZoneInfo("America/Santiago")
     start_at = dt.datetime.combine(report_date, dt.time.min, tzinfo=local_tz).astimezone(dt.timezone.utc)
     end_at = dt.datetime.combine(report_date + dt.timedelta(days=1), dt.time.min, tzinfo=local_tz).astimezone(dt.timezone.utc)
-    query = select(Intervention).where(Intervention.occurred_at >= start_at,
+    query = select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user)).where(Intervention.occurred_at >= start_at,
                                        Intervention.occurred_at < end_at)
     if shift: query = query.where(Intervention.shift == shift)
     rows = db.scalars(query.order_by(Intervention.occurred_at)).all()
     items = [intervention_dict(row) for row in rows]
+    machine_status_counts = dict(db.execute(select(Machine.status, func.count()).group_by(Machine.status)).all())
+    machine_total = sum(machine_status_counts.values())
+    machine_status_labels = {
+        "OPERATIVA": "Operativa", "OPERATIVA_CON_OBSERVACION": "Operativa con observación",
+        "EN_MANTENIMIENTO": "En mantenimiento", "FUERA_DE_SERVICIO": "Fuera de servicio",
+        "PENDIENTE_DE_REPUESTO": "Pendiente de repuesto", "RETIRADA": "Retirada",
+    }
+    machine_fleet = {
+        "total": machine_total,
+        "operating": machine_status_counts.get("OPERATIVA", 0),
+        "operating_with_observation": machine_status_counts.get("OPERATIVA_CON_OBSERVACION", 0),
+        "out_of_service": machine_status_counts.get("FUERA_DE_SERVICIO", 0),
+        "in_maintenance": machine_status_counts.get("EN_MANTENIMIENTO", 0),
+        "waiting_parts": machine_status_counts.get("PENDIENTE_DE_REPUESTO", 0),
+        "retired": machine_status_counts.get("RETIRADA", 0),
+        "worked_on": len({row.machine_id for row in rows if row.machine_id is not None}),
+        "by_status": [{"status": status, "label": machine_status_labels.get(status, status),
+                       "count": count} for status, count in sorted(machine_status_counts.items())],
+    }
+    latest_followup = (select(InterventionFollowUp.intervention_id.label("intervention_id"),
+                              func.max(InterventionFollowUp.id).label("followup_id"))
+                       .group_by(InterventionFollowUp.intervention_id).subquery())
+    handoff_query = (select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user))
+                     .outerjoin(latest_followup, latest_followup.c.intervention_id == Intervention.id)
+                     .outerjoin(InterventionFollowUp, InterventionFollowUp.id == latest_followup.c.followup_id)
+                     .where(or_(and_(latest_followup.c.followup_id.is_(None), Intervention.pending.is_(True)),
+                                InterventionFollowUp.status.in_({"PENDIENTE", "RECIBIDA"}))))
+    handoff_total = db.scalar(select(func.count()).select_from(handoff_query.subquery())) or 0
+    handoff_rows = db.scalars(handoff_query.order_by(Intervention.occurred_at.desc())).all()
+    handoff_items = [intervention_dict(row) for row in handoff_rows]
     return {
         "date": report_date.isoformat(), "shift": shift or "Todos los turnos",
         "total": len(items), "pending_total": sum(1 for item in items if item["pending"]),
+        "received_total": sum(1 for item in items if item["pending"] and item["follow_up_status"] == "RECIBIDA"),
+        "open_handoff_total": handoff_total,
+        "handoff_received_total": sum(1 for item in handoff_items if item["follow_up_status"] == "RECIBIDA"),
+        "handoff_items": handoff_items,
+        "machine_fleet": machine_fleet,
         "items": items,
     }
 
@@ -1478,21 +2054,44 @@ def daily_report_html(report: dict, sender: str) -> str:
     for item in report["items"]:
         occurred = dt.datetime.fromisoformat(item["occurred_at"]) if isinstance(item["occurred_at"], str) else item["occurred_at"]
         local_time = occurred.astimezone(ZoneInfo("America/Santiago")).strftime("%H:%M") if occurred.tzinfo else occurred.strftime("%H:%M")
+        status = "Completada" if not item["pending"] else "Recibida por el turno entrante" if item["follow_up_status"] == "RECIBIDA" else "Pendiente de recepción"
+        if item["follow_up_by"]:
+            status += f" · {item['follow_up_by']}"
+        if item["follow_up_at"]:
+            received_at = item["follow_up_at"]
+            if isinstance(received_at, str): received_at = dt.datetime.fromisoformat(received_at)
+            status += f" · {received_at.astimezone(ZoneInfo('America/Santiago')).strftime('%d/%m %H:%M')}" if received_at.tzinfo else f" · {received_at:%d/%m %H:%M}"
+        details = " · ".join(value for value in (item["detail"], item["follow_up_note"]) if value)
         rows.append(
             "<tr>" + "".join(f"<td>{value}</td>" for value in (
                 esc(local_time), esc(item["work_type"] or item["task"]), esc(item["area"]),
-                esc(item["machine"]), esc(item["island"]), esc(item["detail"]),
-                esc(item["jira_number"]), esc(item["technician"]),
-                "Pendiente" if item["pending"] else "Completada",
+                esc(item["machine"]), esc(item["island"]), esc(details),
+                esc(item["technician"]), esc(status),
             )) + "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="9" style="text-align:center;color:#6b7280">Sin actividades registradas para este período.</td></tr>')
+        rows.append('<tr><td colspan="8" style="text-align:center;color:#6b7280">Sin actividades registradas para este período.</td></tr>')
+    handoff_rows = []
+    for item in report["handoff_items"]:
+        received = item["follow_up_status"] == "RECIBIDA"
+        handoff_rows.append("<tr>" + "".join(f"<td>{value}</td>" for value in (
+            esc(item["machine"] or "—"), esc(item["task"]),
+            esc("Recibida" if received else "Pendiente de recepción"),
+            esc(item["follow_up_by"] if received else "—"), esc(item["follow_up_note"] or item["detail"] or "—"),
+        )) + "</tr>")
+    if not handoff_rows:
+        handoff_rows.append('<tr><td colspan="5" style="text-align:center;color:#6b7280">No hay intervenciones abiertas.</td></tr>')
+    machine_rows = ["<tr>" + "".join(f"<td>{value}</td>" for value in (
+        esc(item["label"]), str(item["count"]))) + "</tr>" for item in report["machine_fleet"]["by_status"]]
+    if not machine_rows:
+        machine_rows.append('<tr><td colspan="2" style="text-align:center;color:#6b7280">Sin máquinas registradas.</td></tr>')
     return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Bitácora diaria</title></head>
     <body style="margin:0;background:#f3f6fa;font-family:Arial,sans-serif;color:#243247"><div style="max-width:1100px;margin:24px auto;background:#fff;border-radius:10px;overflow:hidden">
     <header style="padding:28px 32px;background:#205ca8;color:#fff"><div style="font-size:12px;letter-spacing:1px">GESTIÓN TÉCNICA · CASINO &amp; RESORT</div><h1 style="font-size:24px;margin:10px 0 4px">Informe diario de actividades</h1><div>{esc(report['date'])} · {esc(report['shift'])}</div></header>
-    <section style="padding:24px 32px"><div style="display:flex;gap:24px;margin-bottom:22px"><div><b style="font-size:24px">{report['total']}</b><br><span>Actividades</span></div><div><b style="font-size:24px;color:#d27b1e">{report['pending_total']}</b><br><span>Pendientes</span></div><div><b>Enviado por</b><br><span>{esc(sender)}</span></div></div>
-    <div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Hora','Tarea','Área','Máquina','Isla','Detalle','Ticket Jira','Técnico','Estado'))}</tr></thead><tbody>{''.join(rows)}</tbody></table></div></section>
+    <section style="padding:24px 32px"><div style="display:flex;gap:24px;margin-bottom:22px"><div><b style="font-size:24px">{report['total']}</b><br><span>Actividades</span></div><div><b style="font-size:24px;color:#d27b1e">{report['pending_total']}</b><br><span>Pendientes</span></div><div><b style="font-size:24px;color:#278756">{report['received_total']}</b><br><span>Recibidas por el turno entrante</span></div><div><b>Enviado por</b><br><span>{esc(sender)}</span></div></div>
+    <h2 style="font-size:18px;margin:8px 0 4px">Estado actual del parque · {report['machine_fleet']['total']} máquinas · {report['machine_fleet']['worked_on']} intervenidas en el período</h2><p style="font-size:12px;color:#6b7280;margin:0 0 10px">Estado operativo al momento de generar el informe</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa"><th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">Estado</th><th style="text-align:right;padding:10px;border-bottom:1px solid #dfe6ef">Máquinas</th></tr></thead><tbody>{''.join(machine_rows)}</tbody></table></div>
+    <div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Hora','Tarea','Área','Máquina','Isla','Detalle','Técnico','Estado'))}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>
+    <h2 style="font-size:18px;margin:28px 0 4px">Traspaso de turno · tareas abiertas</h2><p style="font-size:12px;color:#6b7280;margin:0 0 10px">{report['open_handoff_total']} pendientes · {report['handoff_received_total']} recibidas por el turno entrante</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Máquina','Intervención','Estado','Recibida por','Nota de seguimiento'))}</tr></thead><tbody>{''.join(handoff_rows)}</tbody></table></div></section>
     </div></body></html>"""
 
 @app.get("/reports/daily")
@@ -1550,6 +2149,51 @@ def kpi(db: Session = Depends(get_db), _=Depends(staff_user)):
         open_ticket_filter, Ticket.created_at <= now_ - dt.timedelta(hours=72))) or 0
     tickets_sla_overdue = db.scalar(select(func.count(Ticket.id)).where(
         open_ticket_filter, Ticket.sla_due_at.is_not(None), Ticket.sla_due_at <= now_)) or 0
+    tickets_sla_approaching = db.scalar(select(func.count(Ticket.id)).where(
+        open_ticket_filter, Ticket.sla_due_at > now_,
+        Ticket.sla_due_at <= now_ + dt.timedelta(hours=24))) or 0
+    maintenance_overdue = db.scalar(select(func.count(PreventiveMaintenancePlan.id)).where(
+        PreventiveMaintenancePlan.active.is_(True), PreventiveMaintenancePlan.next_due_at < now_)) or 0
+    maintenance_upcoming = db.scalar(select(func.count(PreventiveMaintenancePlan.id)).where(
+        PreventiveMaintenancePlan.active.is_(True), PreventiveMaintenancePlan.next_due_at >= now_,
+        PreventiveMaintenancePlan.next_due_at <= now_ + dt.timedelta(days=7))) or 0
+    due_maintenance_plans = db.scalars(select(PreventiveMaintenancePlan).where(
+        PreventiveMaintenancePlan.active.is_(True),
+        PreventiveMaintenancePlan.next_due_at <= now_ + dt.timedelta(days=7))
+        .order_by(PreventiveMaintenancePlan.next_due_at).limit(5)).all()
+    tickets_urgent = db.scalar(select(func.count(Ticket.id)).where(
+        open_ticket_filter, Ticket.priority.in_({"CRÍTICA", "ALTA"}))) or 0
+    tickets_under_24h = db.scalar(select(func.count(Ticket.id)).where(
+        open_ticket_filter, Ticket.created_at > now_ - dt.timedelta(hours=24))) or 0
+    tickets_24_to_72h = db.scalar(select(func.count(Ticket.id)).where(
+        open_ticket_filter, Ticket.created_at <= now_ - dt.timedelta(hours=24),
+        Ticket.created_at > now_ - dt.timedelta(hours=72))) or 0
+    local_tz = ZoneInfo("America/Santiago")
+    local_today = dt.datetime.now(local_tz).date()
+    trend_start_date = local_today - dt.timedelta(days=6)
+    trend_start = dt.datetime.combine(trend_start_date, dt.time.min, tzinfo=local_tz).astimezone(dt.timezone.utc)
+    trend_end = dt.datetime.combine(local_today + dt.timedelta(days=1), dt.time.min,
+                                    tzinfo=local_tz).astimezone(dt.timezone.utc)
+    trend_days = {(trend_start_date + dt.timedelta(days=offset)).isoformat(): {"created": 0, "resolved": 0}
+                  for offset in range(7)}
+    created_rows = db.scalars(select(Ticket.created_at).where(
+        Ticket.created_at >= trend_start, Ticket.created_at < trend_end)).all()
+    for created_at in created_rows:
+        created_utc = created_at.replace(tzinfo=dt.timezone.utc) if created_at.tzinfo is None else created_at
+        day = created_utc.astimezone(local_tz).date().isoformat()
+        if day in trend_days:
+            trend_days[day]["created"] += 1
+    resolved_rows = db.execute(select(TicketStatusHistory.at, TicketStatusHistory.old_status,
+                                      TicketStatusHistory.new_status).where(
+        TicketStatusHistory.at >= trend_start, TicketStatusHistory.at < trend_end,
+        TicketStatusHistory.new_status.in_({"RESUELTO", "CERRADO"}))).all()
+    for resolved_at, old_status, _new_status in resolved_rows:
+        if _new_status == "CERRADO" and old_status == "RESUELTO":
+            continue
+        resolved_utc = resolved_at.replace(tzinfo=dt.timezone.utc) if resolved_at.tzinfo is None else resolved_at
+        day = resolved_utc.astimezone(local_tz).date().isoformat()
+        if day in trend_days:
+            trend_days[day]["resolved"] += 1
     first_resolution = (select(TicketStatusHistory.ticket_id.label("ticket_id"),
                                func.min(TicketStatusHistory.at).label("resolved_at"))
                         .where(TicketStatusHistory.new_status.in_({"RESUELTO", "CERRADO"}))
@@ -1572,10 +2216,20 @@ def kpi(db: Session = Depends(get_db), _=Depends(staff_user)):
         .limit(5)
     ).all()
     technician_name = func.trim(Intervention.technician)
+    latest_intervention_followup = (select(InterventionFollowUp.intervention_id.label("intervention_id"),
+                                          func.max(InterventionFollowUp.id).label("followup_id"))
+                                   .group_by(InterventionFollowUp.intervention_id).subquery())
+    intervention_pending = case(
+        (latest_intervention_followup.c.followup_id.is_(None), Intervention.pending),
+        (InterventionFollowUp.status.in_({"PENDIENTE", "RECIBIDA"}), True), else_=False)
     technician_rows = db.execute(
         select(technician_name, func.count(Intervention.id),
-               func.sum(case((Intervention.pending.is_(True), 1), else_=0)),
+               func.sum(case((intervention_pending, 1), else_=0)),
                func.max(Intervention.occurred_at))
+        .outerjoin(latest_intervention_followup,
+                   latest_intervention_followup.c.intervention_id == Intervention.id)
+        .outerjoin(InterventionFollowUp,
+                   InterventionFollowUp.id == latest_intervention_followup.c.followup_id)
         .where(Intervention.occurred_at >= period_start,
                Intervention.technician.is_not(None), technician_name != "")
         .group_by(technician_name)
@@ -1597,7 +2251,20 @@ def kpi(db: Session = Depends(get_db), _=Depends(staff_user)):
             "ticket_attention_counts": {"unassigned": tickets_unassigned,
                                         "over_24h": tickets_over_24h,
                                         "over_72h": tickets_over_72h,
-                                        "sla_overdue": tickets_sla_overdue},
+                                        "under_24h": tickets_under_24h,
+                                        "24_to_72h": tickets_24_to_72h,
+                                        "sla_overdue": tickets_sla_overdue,
+                                        "sla_approaching": tickets_sla_approaching,
+                                        "urgent": tickets_urgent},
+            "maintenance_attention": {"overdue": maintenance_overdue,
+                "upcoming_7d": maintenance_upcoming,
+                "plans": [{"id": plan.id, "machine_number": plan.machine.number,
+                           "title": plan.title, "next_due_at": plan.next_due_at,
+                           "overdue": plan.next_due_at < now_} for plan in due_maintenance_plans]},
+            "ticket_age_buckets": {"under_24h": tickets_under_24h,
+                                   "24_to_72h": tickets_24_to_72h,
+                                   "over_72h": tickets_over_72h},
+            "ticket_trend_7d": [{"date": day, **counts} for day, counts in trend_days.items()],
             "sla_performance_30d": {"resolved_with_sla": sla_completed_count,
                                      "resolved_on_time": sla_on_time_count,
                                      "compliance_percent": round(sla_on_time_count / sla_completed_count * 100, 1)
