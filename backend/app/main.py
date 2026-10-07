@@ -2072,17 +2072,9 @@ def daily_report_data(report_date: dt.date, shift: str | None, db: Session):
         "by_status": [{"status": status, "label": machine_status_labels.get(status, status),
                        "count": count} for status, count in sorted(machine_status_counts.items())],
     }
-    latest_followup = (select(InterventionFollowUp.intervention_id.label("intervention_id"),
-                              func.max(InterventionFollowUp.id).label("followup_id"))
-                       .group_by(InterventionFollowUp.intervention_id).subquery())
-    handoff_query = (select(Intervention).options(selectinload(Intervention.follow_ups).selectinload(InterventionFollowUp.user))
-                     .outerjoin(latest_followup, latest_followup.c.intervention_id == Intervention.id)
-                     .outerjoin(InterventionFollowUp, InterventionFollowUp.id == latest_followup.c.followup_id)
-                     .where(or_(and_(latest_followup.c.followup_id.is_(None), Intervention.pending.is_(True)),
-                                InterventionFollowUp.status.in_({"PENDIENTE", "RECIBIDA"}))))
-    handoff_total = db.scalar(select(func.count()).select_from(handoff_query.subquery())) or 0
-    handoff_rows = db.scalars(handoff_query.order_by(Intervention.occurred_at.desc())).all()
-    handoff_items = [intervention_dict(row) for row in handoff_rows]
+    # Use the same date/shift selection as the daily activities, and their current follow-up state.
+    handoff_items = [item for item in items if item["pending"]]
+    handoff_total = len(handoff_items)
     return {
         "date": report_date.isoformat(), "shift": shift or "Todos los turnos",
         "total": len(items), "pending_total": sum(1 for item in items if item["pending"]),
@@ -2096,27 +2088,6 @@ def daily_report_data(report_date: dt.date, shift: str | None, db: Session):
 
 def daily_report_html(report: dict, sender: str) -> str:
     esc = lambda value: html_lib.escape(str(value or ""), quote=True)
-    rows = []
-    for item in report["items"]:
-        occurred = dt.datetime.fromisoformat(item["occurred_at"]) if isinstance(item["occurred_at"], str) else item["occurred_at"]
-        local_time = occurred.astimezone(ZoneInfo("America/Santiago")).strftime("%H:%M") if occurred.tzinfo else occurred.strftime("%H:%M")
-        status = "Completada" if not item["pending"] else "Recibida por el turno entrante" if item["follow_up_status"] == "RECIBIDA" else "Pendiente de recepción"
-        if item["follow_up_by"]:
-            status += f" · {item['follow_up_by']}"
-        if item["follow_up_at"]:
-            received_at = item["follow_up_at"]
-            if isinstance(received_at, str): received_at = dt.datetime.fromisoformat(received_at)
-            status += f" · {received_at.astimezone(ZoneInfo('America/Santiago')).strftime('%d/%m %H:%M')}" if received_at.tzinfo else f" · {received_at:%d/%m %H:%M}"
-        details = " · ".join(value for value in (item["detail"], item["follow_up_note"]) if value)
-        rows.append(
-            "<tr>" + "".join(f"<td>{value}</td>" for value in (
-                esc(local_time), esc(item["work_type"] or item["task"]), esc(item["area"]),
-                esc(item["machine"]), esc(item["island"]), esc(details),
-                esc(item["technician"]), esc(status),
-            )) + "</tr>"
-        )
-    if not rows:
-        rows.append('<tr><td colspan="8" style="text-align:center;color:#6b7280">Sin actividades registradas para este período.</td></tr>')
     handoff_rows = []
     for item in report["handoff_items"]:
         received = item["follow_up_status"] == "RECIBIDA"
@@ -2126,7 +2097,7 @@ def daily_report_html(report: dict, sender: str) -> str:
             esc(item["follow_up_by"] if received else "—"), esc(item["follow_up_note"] or item["detail"] or "—"),
         )) + "</tr>")
     if not handoff_rows:
-        handoff_rows.append('<tr><td colspan="5" style="text-align:center;color:#6b7280">No hay intervenciones abiertas.</td></tr>')
+        handoff_rows.append('<tr><td colspan="5" style="text-align:center;color:#6b7280">No hay actividades pendientes para la fecha y turno seleccionados.</td></tr>')
     machine_rows = ["<tr>" + "".join(f"<td>{value}</td>" for value in (
         esc(item["label"]), str(item["count"]))) + "</tr>" for item in report["machine_fleet"]["by_status"]]
     if not machine_rows:
@@ -2136,8 +2107,7 @@ def daily_report_html(report: dict, sender: str) -> str:
     <header style="padding:28px 32px;background:#205ca8;color:#fff"><div style="font-size:12px;letter-spacing:1px">GESTIÓN TÉCNICA · CASINO &amp; RESORT</div><h1 style="font-size:24px;margin:10px 0 4px">Informe diario de actividades</h1><div>{esc(report['date'])} · {esc(report['shift'])}</div></header>
     <section style="padding:24px 32px"><div style="display:flex;gap:24px;margin-bottom:22px"><div><b style="font-size:24px">{report['total']}</b><br><span>Actividades</span></div><div><b style="font-size:24px;color:#d27b1e">{report['pending_total']}</b><br><span>Pendientes</span></div><div><b style="font-size:24px;color:#278756">{report['received_total']}</b><br><span>Recibidas por el turno entrante</span></div><div><b>Enviado por</b><br><span>{esc(sender)}</span></div></div>
     <h2 style="font-size:18px;margin:8px 0 4px">Estado actual del parque · {report['machine_fleet']['total']} máquinas · {report['machine_fleet']['worked_on']} intervenidas en el período</h2><p style="font-size:12px;color:#6b7280;margin:0 0 10px">Estado operativo al momento de generar el informe</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa"><th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">Estado</th><th style="text-align:right;padding:10px;border-bottom:1px solid #dfe6ef">Máquinas</th></tr></thead><tbody>{''.join(machine_rows)}</tbody></table></div>
-    <div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Hora','Tarea','Área','Máquina','Isla','Detalle','Técnico','Estado'))}</tr></thead><tbody>{''.join(rows)}</tbody></table></div>
-    <h2 style="font-size:18px;margin:28px 0 4px">Traspaso de turno · tareas abiertas</h2><p style="font-size:12px;color:#6b7280;margin:0 0 10px">{report['open_handoff_total']} pendientes · {report['handoff_received_total']} recibidas por el turno entrante</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Máquina','Intervención','Estado','Recibida por','Nota de seguimiento'))}</tr></thead><tbody>{''.join(handoff_rows)}</tbody></table></div></section>
+    <h2 style="font-size:18px;margin:28px 0 4px">Actividades pendientes del día</h2><p style="font-size:12px;color:#6b7280;margin:0 0 10px">{report['open_handoff_total']} pendientes · {report['handoff_received_total']} recibidas por el turno entrante</p><div style="overflow:auto"><table style="width:100%;border-collapse:collapse;font-size:13px"><thead><tr style="background:#eef3fa">{''.join(f'<th style="text-align:left;padding:10px;border-bottom:1px solid #dfe6ef">{label}</th>' for label in ('Máquina','Intervención','Estado','Recibida por','Nota de seguimiento'))}</tr></thead><tbody>{''.join(handoff_rows)}</tbody></table></div></section>
     </div></body></html>"""
 
 @app.get("/reports/daily")
