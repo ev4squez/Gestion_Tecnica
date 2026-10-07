@@ -29,6 +29,8 @@ class FloorPlan(Base):
 class Technician(Base):
     __tablename__ = "technicians"
     id: Mapped[int] = mapped_column(primary_key=True)
+    avatar_data: Mapped[bytes | None] = mapped_column(LargeBinary)
+    avatar_content_type: Mapped[str | None] = mapped_column(String(30))
     first_name: Mapped[str] = mapped_column(String(80))
     last_name: Mapped[str] = mapped_column(String(80))
     position: Mapped[str | None] = mapped_column(String(80))

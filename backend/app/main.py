@@ -98,6 +98,7 @@ def migrate_schema():
             missing_columns = []
             migrated_columns = {"interventions": {"island", "jira_number", "pending"},
                                 "users": {"technician_id", "avatar_data", "avatar_content_type"},
+                                "technicians": {"avatar_data", "avatar_content_type"},
                                 "tickets": {"sla_due_at", "sla_overdue_notified_at", "sla_approaching_notified_at"},
                                 "machines": {"position_x", "position_y"}}
             for table_name in sorted(LEGACY_TABLES):
@@ -384,9 +385,7 @@ def get_my_avatar(u: User = Depends(current_user)):
     return Response(content=u.avatar_data, media_type=u.avatar_content_type,
                     headers={"Cache-Control": "private, no-store"})
 
-@app.put("/auth/me/avatar")
-async def update_my_avatar(file: UploadFile = File(...), db: Session = Depends(get_db),
-                          u: User = Depends(current_user)):
+async def read_avatar_image(file: UploadFile):
     allowed_signatures = {
         "image/jpeg": (b"\xff\xd8\xff",),
         "image/png": (b"\x89PNG\r\n\x1a\n",),
@@ -403,6 +402,12 @@ async def update_my_avatar(file: UploadFile = File(...), db: Session = Depends(g
         valid_signature = valid_signature and image[8:12] == b"WEBP"
     if not valid_signature:
         raise HTTPException(415, "El archivo no coincide con el formato de imagen indicado")
+    return image, content_type
+
+@app.put("/auth/me/avatar")
+async def update_my_avatar(file: UploadFile = File(...), db: Session = Depends(get_db),
+                          u: User = Depends(current_user)):
+    image, content_type = await read_avatar_image(file)
     u.avatar_data = image
     u.avatar_content_type = content_type
     audit(db, u, "ACTUALIZAR_AVATAR", f"user:{u.id}", None,
@@ -490,6 +495,10 @@ def validate_system_user(data: SystemUserIn, db: Session, user_id: int | None = 
     if duplicate: raise HTTPException(409, "Ya existe una cuenta con ese correo")
     technician = db.get(Technician, data.technician_id) if data.technician_id else None
     if data.technician_id and not technician: raise HTTPException(404, "La ficha de técnico no existe")
+    if technician and technician.status == "INACTIVO":
+        existing_user = db.get(User, user_id) if user_id else None
+        if not existing_user or existing_user.technician_id != technician.id:
+            raise HTTPException(422, "No puedes vincular un técnico inactivo")
     if technician:
         linked = db.scalar(select(User.id).where(User.technician_id == technician.id,
                                                  User.id != (user_id or -1)))
@@ -639,6 +648,29 @@ class TechnicianIn(BaseModel):
     hire_date: dt.date | None = None
     notes: str | None = None
 
+@app.get("/technicians/{technician_id}/avatar")
+def get_technician_avatar(technician_id: int, db: Session = Depends(get_db), _=Depends(staff_user)):
+    technician = db.get(Technician, technician_id)
+    if not technician: raise HTTPException(404, "Técnico no existe")
+    if not technician.avatar_data: raise HTTPException(404, "El técnico no tiene una foto cargada")
+    return Response(content=technician.avatar_data, media_type=technician.avatar_content_type,
+                    headers={"Cache-Control": "private, no-store"})
+
+@app.put("/technicians/{technician_id}/avatar")
+async def update_technician_avatar(technician_id: int, file: UploadFile = File(...),
+                                   db: Session = Depends(get_db), u=Depends(staff_user)):
+    technician = db.get(Technician, technician_id)
+    if not technician: raise HTTPException(404, "Técnico no existe")
+    if u.role not in {"ADMIN", "JEFE"} and u.technician_id != technician_id:
+        raise HTTPException(403, "Solo puedes cambiar tu propia foto")
+    image, content_type = await read_avatar_image(file)
+    technician.avatar_data = image
+    technician.avatar_content_type = content_type
+    audit(db, u, "ACTUALIZAR_AVATAR_TECNICO", f"technician:{technician_id}", None,
+          {"content_type": content_type, "size": len(image)})
+    db.commit()
+    return {"has_avatar": True}
+
 @app.get("/technicians")
 def list_technicians(status: str | None = None, q: str | None = None,
                      page: int = Query(1, ge=1), size: int = Query(50, le=200),
@@ -658,6 +690,15 @@ def technician_dict(t):
             "position": t.position, "username": t.username, "status": t.status,
             "shift": t.shift, "contracted_hours": t.contracted_hours,
             "specialties": t.specialties, "hire_date": t.hire_date, "notes": t.notes}
+
+def validate_technician_assignment(db: Session, name: str | None, previous: str | None = None):
+    normalized = (name or "").strip().casefold()
+    if not normalized or normalized == (previous or "").strip().casefold():
+        return
+    matches = [tech for tech in db.scalars(select(Technician)).all()
+               if f"{tech.first_name} {tech.last_name}".strip().casefold() == normalized]
+    if matches and all(tech.status == "INACTIVO" for tech in matches):
+        raise HTTPException(422, "El técnico está inactivo; selecciona otro técnico")
 
 def validate_technician(t: TechnicianIn):
     if not t.first_name.strip() or not t.last_name.strip():
@@ -913,6 +954,7 @@ class PartMovementIn(BaseModel):
 
 @app.post("/parts/{part_id}/movements", status_code=201)
 def move_part(part_id: int, m: PartMovementIn, db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
+    validate_technician_assignment(db, m.technician)
     if m.movement_type not in {"ENTRADA", "SALIDA", "CONSUMO", "AJUSTE"}:
         raise HTTPException(422, "Tipo de movimiento inválido")
     if m.quantity == 0: raise HTTPException(422, "La cantidad no puede ser cero")
@@ -1603,6 +1645,8 @@ def update_ticket(ticket_id: int, update: TicketUpdate, db: Session = Depends(ge
     ticket = db.get(Ticket, ticket_id)
     if not ticket: raise HTTPException(404, "Ticket no existe")
     values = update.model_dump(exclude_unset=True)
+    if "technician" in values:
+        validate_technician_assignment(db, values["technician"], ticket.technician)
     note = values.pop("note", None)
     parts_used = values.pop("parts_used", [])
     inventory_parts = lock_inventory_for_usage(parts_used, db)
@@ -1695,6 +1739,7 @@ def complete_maintenance_plan(plan_id: int, payload: MaintenanceCompleteIn,
                               db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
     plan = db.get(PreventiveMaintenancePlan, plan_id)
     if not plan: raise HTTPException(404, "Plan no existe")
+    validate_technician_assignment(db, payload.technician.strip() or u.full_name or u.username)
     now_ = dt.datetime.now(dt.timezone.utc)
     previous_due = plan.next_due_at
     db.add(PreventiveMaintenanceLog(plan_id=plan.id, machine_id=plan.machine_id,
@@ -1822,6 +1867,7 @@ def intervention_dict(i: Intervention):
 
 @app.post("/interventions", status_code=201)
 def create_intervention(data: InterventionIn, db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
+    validate_technician_assignment(db, data.technician)
     if not data.task.strip(): raise HTTPException(422, "La tarea realizada es obligatoria")
     ticket = db.get(Ticket, data.ticket_id) if data.ticket_id else None
     if data.ticket_id and not ticket: raise HTTPException(422, "Ticket relacionado no existe")
