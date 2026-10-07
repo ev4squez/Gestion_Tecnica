@@ -2036,13 +2036,16 @@ def list_pending_interventions(page: int = Query(1, ge=1), size: int = Query(8, 
         func.sum(case((and_(or_(pending_rows.c.status.is_(None), pending_rows.c.status == "PENDIENTE"),
                             pending_rows.c.occurred_at <= cutoff), 1), else_=0)).label("overdue_total")
     ).group_by(pending_rows.c.island)).all()
+    island_items = {}
+    all_pending = db.scalars(query.order_by(
+        (InterventionFollowUp.status == "RECIBIDA").asc().nullsfirst(),
+        Intervention.occurred_at.asc(), Intervention.id.asc())).all()
+    for intervention in all_pending:
+        island_items.setdefault(intervention.island, []).append(intervention_dict(intervention))
     groups = []
     for island, group_total, received, overdue in group_counts:
-        preview = db.scalars(query.where(Intervention.island == island).order_by(
-            (InterventionFollowUp.status == "RECIBIDA").asc().nullsfirst(),
-            Intervention.occurred_at.asc(), Intervention.id.asc()).limit(3)).all()
         groups.append({"island": island, "total": group_total, "received_total": received,
-                       "overdue_total": overdue, "items": [intervention_dict(row) for row in preview]})
+                       "overdue_total": overdue, "items": island_items.get(island, [])})
     groups.sort(key=lambda group: (-group["overdue_total"], str(group["island"] or "")))
     return {"total": total, "received_total": received_total, "overdue_total": overdue_total,
             "groups": groups, "oldest_awaiting_at": oldest_awaiting_at,
