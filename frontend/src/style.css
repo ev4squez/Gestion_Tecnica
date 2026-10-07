@@ -206,3 +206,5 @@ tr:hover td{background:#fafbff}
  .activity-panel td>*{grid-column:2;min-width:0}
  .activity-panel .activity-pagination>div{flex-wrap:wrap}
 }
+
+.activity-chart-scroll{overflow-x:auto}.activity-chart-scroll .activity-chart{min-width:850px;gap:2px;padding-inline:12px}.activity-chart-scroll .activity-chart-day{padding-inline:0}.activity-chart-scroll .activity-chart-track i{width:70%;max-width:20px}

@@ -2017,8 +2017,35 @@ def list_pending_interventions(page: int = Query(1, ge=1), size: int = Query(8, 
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
     received_total = db.scalar(select(func.count()).select_from(query.where(
         InterventionFollowUp.status == "RECIBIDA").subquery())) or 0
-    rows = db.scalars(query.order_by(Intervention.occurred_at.desc()).offset((page-1)*size).limit(size)).all()
-    return {"total": total, "received_total": received_total,
+    awaiting = query.where(or_(latest_followup.c.followup_id.is_(None),
+                               InterventionFollowUp.status == "PENDIENTE"))
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=24)
+    overdue_total = db.scalar(select(func.count()).select_from(
+        awaiting.where(Intervention.occurred_at <= cutoff).subquery())) or 0
+    awaiting_rows = awaiting.with_only_columns(Intervention.occurred_at).order_by(Intervention.occurred_at.asc()).limit(1)
+    oldest_awaiting_at = db.scalar(awaiting_rows)
+    rows = db.scalars(query.order_by(
+        (InterventionFollowUp.status == "RECIBIDA").asc().nullsfirst(),
+        Intervention.occurred_at.asc(), Intervention.id.asc()).offset((page-1)*size).limit(size)).all()
+    pending_rows = query.with_only_columns(
+        Intervention.island.label("island"), Intervention.occurred_at.label("occurred_at"),
+        InterventionFollowUp.status.label("status")).subquery()
+    group_counts = db.execute(select(
+        pending_rows.c.island, func.count().label("total"),
+        func.sum(case((pending_rows.c.status == "RECIBIDA", 1), else_=0)).label("received_total"),
+        func.sum(case((and_(or_(pending_rows.c.status.is_(None), pending_rows.c.status == "PENDIENTE"),
+                            pending_rows.c.occurred_at <= cutoff), 1), else_=0)).label("overdue_total")
+    ).group_by(pending_rows.c.island)).all()
+    groups = []
+    for island, group_total, received, overdue in group_counts:
+        preview = db.scalars(query.where(Intervention.island == island).order_by(
+            (InterventionFollowUp.status == "RECIBIDA").asc().nullsfirst(),
+            Intervention.occurred_at.asc(), Intervention.id.asc()).limit(3)).all()
+        groups.append({"island": island, "total": group_total, "received_total": received,
+                       "overdue_total": overdue, "items": [intervention_dict(row) for row in preview]})
+    groups.sort(key=lambda group: (-group["overdue_total"], str(group["island"] or "")))
+    return {"total": total, "received_total": received_total, "overdue_total": overdue_total,
+            "groups": groups, "oldest_awaiting_at": oldest_awaiting_at,
             "items": [intervention_dict(row) for row in rows]}
 
 @app.post("/interventions/{intervention_id}/follow-ups", status_code=201)
