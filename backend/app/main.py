@@ -1867,6 +1867,8 @@ def intervention_dict(i: Intervention):
 
 @app.post("/interventions", status_code=201)
 def create_intervention(data: InterventionIn, db: Session = Depends(get_db), u=Depends(require(*WRITERS))):
+    if not data.technician or not data.technician.strip():
+        raise HTTPException(422, "Selecciona un técnico para registrar la intervención")
     validate_technician_assignment(db, data.technician)
     if not data.task.strip(): raise HTTPException(422, "La tarea realizada es obligatoria")
     ticket = db.get(Ticket, data.ticket_id) if data.ticket_id else None
